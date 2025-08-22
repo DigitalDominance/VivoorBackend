@@ -1,12 +1,12 @@
 /**
- * Watermark Backend (Express + FFmpeg)
- * - POST /watermark : add a PNG watermark to an MP4
- *   Accepts either an uploaded file ("video") or a remote URL ("videoUrl").
- *   Optional fields: position (br|bl|tr|tl), margin (px), wmWidth (px), filename (for the response name)
- * - GET /health     : simple health check
+ * Vivoor Watermark API + WebSockets (Heroku-ready)
+ * - POST /watermark : add a PNG watermark to an MP4 (file upload or remote URL)
+ * - GET  /health    : simple health check
+ * - WS   /ws?streamId=<ID>&token=<optional> : per-stream rooms for chat/notifications
  *
- * Heroku notes:
- * - Requires FFmpeg buildpack. See README.md
+ * Requires:
+ * - FFmpeg installed (Heroku FFmpeg buildpack)
+ * - Web dyno (Heroku supports WebSockets)
  */
 const express = require("express");
 const cors = require("cors");
@@ -17,11 +17,14 @@ const os = require("os");
 const { spawn } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
+const http = require("http");
+const { URL } = require("url");
+const WebSocket = require("ws");
 
 const app = express();
 app.set("x-powered-by", false);
 
-// --- CORS ---
+/* ----------------------------- C O R S ---------------------------------- */
 const ALLOWED_ORIGINS = new Set([
   "https://preview--vivoor-live-glow.lovable.app",
   "https://www.vivoor.xyz",
@@ -39,22 +42,18 @@ app.use(
 // Parse small JSON bodies (not used for file upload but fine for /health etc)
 app.use(express.json({ limit: "100kb" }));
 
-// --- Multer (uploads to tmpfs/ephemeral) ---
+/* ---------------------------- U P L O A D S ------------------------------ */
 const upload = multer({
   dest: os.tmpdir(),
-  limits: {
-    fileSize: Number(process.env.MAX_UPLOAD_MB || 300) * 1024 * 1024, // default 300MB
-  },
+  limits: { fileSize: Number(process.env.MAX_UPLOAD_MB || 300) * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype === "video/mp4") cb(null, true);
     else cb(new Error("Only video/mp4 is accepted"));
   },
 });
 
-// Helpers
-function nowTs() {
-  return Math.floor(Date.now() / 1000);
-}
+/* ------------------------------ H E L P E R S ---------------------------- */
+function nowTs() { return Math.floor(Date.now() / 1000); }
 
 async function downloadToFile(url, outPath) {
   const res = await fetch(url);
@@ -65,30 +64,21 @@ async function downloadToFile(url, outPath) {
 }
 
 function buildOverlayXY(position, margin) {
-  const m = Number.isFinite(margin) ? margin : 24;
+  const m = Number.isFinite(+margin) ? +margin : 24;
   switch (position) {
-    case "tl":
-      return { x: `${m}`, y: `${m}` };
-    case "tr":
-      return { x: `main_w-overlay_w-${m}`, y: `${m}` };
-    case "bl":
-      return { x: `${m}`, y: `main_h-overlay_h-${m}` };
+    case "tl": return { x: `${m}`, y: `${m}` };
+    case "tr": return { x: `main_w-overlay_w-${m}`, y: `${m}` };
+    case "bl": return { x: `${m}`, y: `main_h-overlay_h-${m}` };
     case "br":
-    default:
-      return { x: `main_w-overlay_w-${m}`, y: `main_h-overlay_h-${m}` };
+    default:   return { x: `main_w-overlay_w-${m}`, y: `main_h-overlay_h-${m}` };
   }
 }
 
-/**
- * Compose the -filter_complex for FFmpeg.
- * If wmWidthPx is provided, we pre-scale the watermark to that pixel width, maintaining AR.
- */
 function makeFilter(position, margin, wmWidthPx) {
   const { x, y } = buildOverlayXY(position, margin);
   if (wmWidthPx && Number(wmWidthPx) > 0) {
     return `[1:v]scale=${Math.floor(Number(wmWidthPx))}:-1[wm];[0:v][wm]overlay=${x}:${y}:format=auto`;
   }
-  // No pre-scale; use watermark as-is.
   return `[0:v][1:v]overlay=${x}:${y}:format=auto`;
 }
 
@@ -96,10 +86,10 @@ async function runFfmpeg(inPath, wmPath, outPath, opts = {}) {
   const {
     position = "br",
     margin = 24,
-    wmWidth = Number(process.env.WM_WIDTH_PX || 0), // 0 = no scaling
+    wmWidth = Number(process.env.WM_WIDTH_PX || 0),
     preset = process.env.FFMPEG_PRESET || "veryfast",
     crf = Number(process.env.FFMPEG_CRF || 20),
-    threads = Number(process.env.FFMPEG_THREADS || 0), // 0 lets ffmpeg decide
+    threads = Number(process.env.FFMPEG_THREADS || 0),
   } = opts;
 
   const filter = makeFilter(position, Number(margin), wmWidth);
@@ -114,18 +104,13 @@ async function runFfmpeg(inPath, wmPath, outPath, opts = {}) {
     "-pix_fmt", "yuv420p",
     "-c:a", "copy",
   ];
-  if (threads > 0) {
-    args.push("-threads", String(threads));
-  }
+  if (threads > 0) args.push("-threads", String(threads));
   args.push(outPath);
 
-  return await new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const p = spawn("ffmpeg", args, { stdio: ["ignore", "inherit", "inherit"] });
     p.on("error", reject);
-    p.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exited with ${code}`));
-    });
+    p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`ffmpeg exited with ${code}`)));
   });
 }
 
@@ -134,6 +119,7 @@ function safeUnlink(p) {
   fs.promises.unlink(p).catch(() => {});
 }
 
+/* -------------------------------- A P I ---------------------------------- */
 app.get("/health", (_req, res) => {
   res.json({ ok: true, time: nowTs() });
 });
@@ -147,11 +133,8 @@ app.get("/health", (_req, res) => {
  *  - margin: number px (default: 24)
  *  - wmWidth: number px (optional)
  *  - filename: desired download filename (optional, default "watermarked.mp4")
- *
- * Watermark source:
- *  - WATERMARK_URL env (downloaded each time), OR
- *  - WATERMARK_PATH env (absolute path), OR
- *  - ./assets/logo.png (repo file)
+ * Watermark source resolution order:
+ *  - WATERMARK_URL env, WATERMARK_PATH env, ./assets/logo.png
  */
 app.post("/watermark", upload.single("video"), async (req, res) => {
   let inputPath = null;
@@ -162,14 +145,14 @@ app.post("/watermark", upload.single("video"), async (req, res) => {
   try {
     const { videoUrl, position, margin, wmWidth, filename } = req.body || {};
 
-    // 1) Resolve video input
+    // 1) Resolve input video
     if (req.file?.path) {
       inputPath = req.file.path;
     } else if (videoUrl) {
       inputPath = path.join(tmp, "input.mp4");
       await downloadToFile(videoUrl, inputPath);
     } else {
-      return res.status(400).json({ error: "Provide 'video' file or 'videoUrl'." });
+      return res.status(400).json({ error: "Provide 'video' or 'videoUrl'." });
     }
 
     // 2) Resolve watermark
@@ -188,14 +171,13 @@ app.post("/watermark", upload.single("video"), async (req, res) => {
     // 3) Run ffmpeg
     await runFfmpeg(inputPath, wmPath, outPath, { position, margin, wmWidth });
 
-    // 4) Stream back as download
+    // 4) Stream back
     const name = (filename && String(filename).trim()) || "watermarked.mp4";
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
     const read = fs.createReadStream(outPath);
     read.pipe(res);
     read.on("close", () => {
-      // cleanup after response ends
       safeUnlink(inputPath);
       if (process.env.WATERMARK_URL) safeUnlink(wmPath);
       safeUnlink(outPath);
@@ -211,12 +193,98 @@ app.post("/watermark", upload.single("video"), async (req, res) => {
   }
 });
 
-// Root
 app.get("/", (_req, res) => {
-  res.type("text").send("Vivoor Watermark API. POST /watermark to add a logo to an MP4.");
+  res.type("text").send("Vivoor Watermark API + WebSockets. POST /watermark to add a logo to an MP4. WS at /ws?streamId=ID");
 });
 
+/* ----------------------------- W E B S O C K E T ------------------------- */
+/**
+ * WS endpoint: /ws?streamId=<ID>&token=<optional>
+ * Each streamId is a "room". Broadcasts go to that room only.
+ */
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ noServer: true });
+const rooms = new Map(); // streamId -> Set<ws>
+const HEARTBEAT_MS = 25000;
+
+function joinRoom(streamId, ws) {
+  if (!rooms.has(streamId)) rooms.set(streamId, new Set());
+  rooms.get(streamId).add(ws);
+  ws._roomId = streamId;
+}
+function leaveRoom(ws) {
+  const id = ws._roomId;
+  if (!id) return;
+  const set = rooms.get(id);
+  if (set) {
+    set.delete(ws);
+    if (set.size === 0) rooms.delete(id);
+  }
+  delete ws._roomId;
+}
+function broadcast(streamId, obj) {
+  const set = rooms.get(streamId);
+  if (!set) return;
+  const msg = JSON.stringify(obj);
+  for (const client of set) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+}
+function heartbeat() { this.isAlive = true; }
+
+wss.on("connection", (ws, request) => {
+  ws.isAlive = true;
+  ws.on("pong", heartbeat);
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(String(raw || "{}"));
+      if (msg.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong", t: Date.now() }));
+        return;
+      }
+      const streamId = ws._roomId;
+      if (!streamId) return;
+      broadcast(streamId, { ...msg, streamId, serverTs: Date.now() });
+    } catch {}
+  });
+  ws.on("close", () => leaveRoom(ws));
+  ws.on("error", () => leaveRoom(ws));
+});
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const origin = req.headers.origin || "";
+    if (origin && !ALLOWED_ORIGINS.has(origin)) {
+      socket.destroy();
+      return;
+    }
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    if (u.pathname !== "/ws") { socket.destroy(); return; }
+    const streamId = u.searchParams.get("streamId");
+    if (!streamId) { socket.destroy(); return; }
+    // TODO: validate ?token=... if you add auth
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit("connection", ws, req);
+      joinRoom(streamId, ws);
+      ws.send(JSON.stringify({ type: "hello", streamId, serverTs: Date.now() }));
+    });
+  } catch {
+    socket.destroy();
+  }
+});
+
+// Heartbeat to keep connections healthy on proxies
+const interval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, HEARTBEAT_MS);
+wss.on("close", () => clearInterval(interval));
+
+/* --------------------------------- S T A R T ----------------------------- */
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
-  console.log(`[watermark] listening on :${PORT}`);
+server.listen(PORT, () => {
+  console.log(`[watermark+ws] listening on :${PORT}`);
 });
