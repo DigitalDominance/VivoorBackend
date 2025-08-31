@@ -24,15 +24,6 @@ const WebSocket = require("ws");
 const app = express();
 app.set("x-powered-by", false);
 
-/* ----------------------------- T I M E O U T S --------------------------- */
-/** Increase Node/Express timeouts to ~2 minutes (Heroku H12 still requires TTFB < 30s). */
-const REQ_TIMEOUT_MS = Number(process.env.REQ_TIMEOUT_MS || 120000);
-app.use((req, res, next) => {
-  req.setTimeout(REQ_TIMEOUT_MS);
-  res.setTimeout(REQ_TIMEOUT_MS);
-  next();
-});
-
 /* ----------------------------- C O R S ---------------------------------- */
 const ALLOWED_ORIGINS = new Set([
   "https://preview--vivoor-live-glow.lovable.app",
@@ -138,42 +129,9 @@ function safeUnlink(p) {
   fs.promises.unlink(p).catch(() => {});
 }
 
-/* ------------------------------- Q U E U E ------------------------------- */
-/** Simple FIFO queue to limit concurrent watermark jobs. */
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 1);
-const QUEUE_MAX_LENGTH = Number(process.env.QUEUE_MAX_LENGTH || 50);
-
-let active = 0;
-const queue = []; // { job, resolve, reject }
-
-function runNext() {
-  if (active >= MAX_CONCURRENCY) return;
-  const item = queue.shift();
-  if (!item) return;
-  active++;
-  Promise.resolve()
-    .then(item.job)
-    .then((v) => item.resolve(v))
-    .catch((e) => item.reject(e))
-    .finally(() => {
-      active--;
-      runNext();
-    });
-}
-
-function enqueue(job) {
-  return new Promise((resolve, reject) => {
-    if (queue.length >= QUEUE_MAX_LENGTH) {
-      return reject(new Error("Queue full"));
-    }
-    queue.push({ job, resolve, reject });
-    runNext();
-  });
-}
-
 /* -------------------------------- A P I ---------------------------------- */
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, time: nowTs(), active, queued: queue.length });
+  res.json({ ok: true, time: nowTs() });
 });
 
 /**
@@ -189,90 +147,82 @@ app.get("/health", (_req, res) => {
  *  - WATERMARK_URL env, WATERMARK_PATH env, ./assets/logo.png
  */
 app.post("/watermark", upload.single("video"), async (req, res) => {
-  // If queue is too long, fail fast so the caller can fallback.
-  if (queue.length >= QUEUE_MAX_LENGTH) {
-    res.status(503).json({ error: "Server busy, please retry", queued: queue.length });
-    return;
-  }
-
-  // Ensure long-lived response objects don't get cut off by Node's own timeout.
-  res.setTimeout(REQ_TIMEOUT_MS);
+  let inputPath = null;
+  let wmPath = null;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wmk-"));
+  const outPath = path.join(tmp, `out-${Date.now()}.mp4`);
 
   try {
-    await enqueue(async () => {
-      let inputPath = null;
-      let wmPath = null;
-      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wmk-"));
-      const outPath = path.join(tmp, `out-${Date.now()}.mp4`);
+    const { videoUrl, position, margin, wmWidth, filename } = req.body || {};
 
-      try {
-        const { videoUrl, position, margin, wmWidth, filename } = req.body || {};
-
-        // 1) Resolve input video
-        if (req.file?.path) {
-          inputPath = req.file.path;
-        } else if (videoUrl) {
-          inputPath = path.join(tmp, "input.mp4");
-          await downloadToFile(videoUrl, inputPath);
-        } else {
-          res.status(400).json({ error: "Provide 'video' or 'videoUrl'." });
-          return;
-        }
-
-        // 2) Resolve watermark
-        if (process.env.WATERMARK_URL) {
-          wmPath = path.join(tmp, "wm.png");
-          await downloadToFile(process.env.WATERMARK_URL, wmPath);
-        } else if (process.env.WATERMARK_PATH && fs.existsSync(process.env.WATERMARK_PATH)) {
-          wmPath = process.env.WATERMARK_PATH;
-        } else {
-          wmPath = path.join(__dirname, "assets", "logo.png");
-          if (!fs.existsSync(wmPath)) {
-            res.status(500).json({ error: "Watermark not found. Set WATERMARK_URL or add assets/logo.png" });
-            return;
-          }
-        }
-
-        // 3) Run ffmpeg
-        await runFfmpeg(inputPath, wmPath, outPath, { position, margin, wmWidth });
-
-        // 4) Stream back the result
-        const name = (filename && String(filename).trim()) || "watermarked.mp4";
-        res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
-        const readStream = fs.createReadStream(outPath);
-        readStream.pipe(res);
-
-        // Cleanup after response finishes
-        const cleanup = () => {
-          safeUnlink(outPath);
-          // removing input video file and temporary watermark if downloaded
-          safeUnlink(inputPath);
-          if (process.env.WATERMARK_URL) safeUnlink(wmPath);
-          fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {});
-        };
-        readStream.on("close", cleanup);
-        res.on("finish", cleanup);
-      } catch (err) {
-        console.error("[/watermark] error:", err);
-        // Best-effort cleanup on error
-        safeUnlink(inputPath);
-        if (process.env.WATERMARK_URL) safeUnlink(wmPath);
-        try { fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {}); } catch {}
-        if (!res.headersSent) {
-          res.status(500).json({ error: String(err && err.message || err) });
-        } else {
-          try { res.destroy(err); } catch {}
-        }
-      }
-    });
-  } catch (e) {
-    // Queue rejected (e.g., full)
-    if (!res.headersSent) {
-      res.status(503).json({ error: String(e.message || e), queued: queue.length });
+    // 1) Resolve input video
+    if (req.file?.path) {
+      inputPath = req.file.path;
+    } else if (videoUrl) {
+      inputPath = path.join(tmp, "input.mp4");
+      await downloadToFile(videoUrl, inputPath);
     } else {
-      try { res.destroy(e); } catch {}
+      return res.status(400).json({ error: "Provide 'video' or 'videoUrl'." });
     }
+
+    // 2) Resolve watermark
+    if (process.env.WATERMARK_URL) {
+      wmPath = path.join(tmp, "wm.png");
+      await downloadToFile(process.env.WATERMARK_URL, wmPath);
+    } else if (process.env.WATERMARK_PATH && fs.existsSync(process.env.WATERMARK_PATH)) {
+      wmPath = process.env.WATERMARK_PATH;
+    } else {
+      wmPath = path.join(__dirname, "assets", "logo.png");
+      if (!fs.existsSync(wmPath)) {
+        return res.status(500).json({ error: "Watermark not found. Set WATERMARK_URL or add assets/logo.png" });
+      }
+    }
+
+    // 3) Run ffmpeg
+    await runFfmpeg(inputPath, wmPath, outPath, { position, margin, wmWidth });
+
+    /*
+     * At this point FFmpeg has finished and the output file has been flushed to disk. We
+     * no longer need the input video or any downloaded watermark asset to remain on
+     * disk. Removing these immediately frees up disk space and allows the kernel to
+     * release any associated caches, which can help prevent memory bloat on Heroku.
+     */
+    safeUnlink(inputPath);
+    // Only remove the downloaded watermark if WATERMARK_URL was used. When using
+    // WATERMARK_PATH or the built‑in asset the file lives outside of the temp
+    // directory and should not be deleted.
+    if (process.env.WATERMARK_URL) safeUnlink(wmPath);
+
+    // 4) Stream back the result. Use a read stream so the file is not buffered
+    // into memory. Once the response is finished we clean up the output file and
+    // temporary directory.
+    const name = (filename && String(filename).trim()) || "watermarked.mp4";
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
+    const readStream = fs.createReadStream(outPath);
+    readStream.pipe(res);
+
+    const cleanup = () => {
+      // Remove the watermarked file itself. This happens after the file has
+      // finished streaming to the client. Using safeUnlink ensures any errors
+      // during deletion are ignored.
+      safeUnlink(outPath);
+      // Remove the temporary directory created for this request. This forces
+      // removal even if there are lingering handles.
+      fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    };
+    // When the read stream ends normally the 'close' event fires. On some
+    // connections Express will emit 'finish' on the response instead. Listen
+    // to both to ensure cleanup always occurs.
+    readStream.on("close", cleanup);
+    res.on("finish", cleanup);
+  } catch (err) {
+    console.error("[/watermark] error:", err);
+    safeUnlink(inputPath);
+    if (process.env.WATERMARK_URL) safeUnlink(wmPath);
+    safeUnlink(outPath);
+    fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    res.status(500).json({ error: String(err.message || err) });
   }
 });
 
@@ -287,11 +237,6 @@ app.get("/", (_req, res) => {
  */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
-
-// Increase server timeouts so Node doesn't kill long responses.
-server.requestTimeout = Number(process.env.SERVER_REQUEST_TIMEOUT_MS || 2 * 60 * 1000);
-server.headersTimeout = Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 2 * 60 * 1000);
-
 const rooms = new Map(); // streamId -> Set<ws>
 const HEARTBEAT_MS = 25000;
 
