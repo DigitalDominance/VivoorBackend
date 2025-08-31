@@ -24,6 +24,9 @@ const WebSocket = require("ws");
 const app = express();
 app.set("x-powered-by", false);
 
+// === timeout tweak: 2 minutes (in ms) ===
+const TWO_MIN_MS = 2 * 60 * 1000;
+
 /* ----------------------------- C O R S ---------------------------------- */
 const ALLOWED_ORIGINS = new Set([
   "https://preview--vivoor-live-glow.lovable.app",
@@ -42,6 +45,14 @@ app.use(
 
 // Parse small JSON bodies (not used for file upload but fine for /health etc)
 app.use(express.json({ limit: "100kb" }));
+
+// === per-route timeout for /watermark (request + response) ===
+app.use("/watermark", (req, res, next) => {
+  // Extend socket timeouts for this route only
+  req.setTimeout(TWO_MIN_MS);
+  res.setTimeout(TWO_MIN_MS);
+  next();
+});
 
 /* ---------------------------- U P L O A D S ------------------------------ */
 const upload = multer({
@@ -189,7 +200,7 @@ app.post("/watermark", upload.single("video"), async (req, res) => {
      */
     safeUnlink(inputPath);
     // Only remove the downloaded watermark if WATERMARK_URL was used. When using
-    // WATERMARK_PATH or the built‑in asset the file lives outside of the temp
+    // WATERMARK_PATH or the built-in asset the file lives outside of the temp
     // directory and should not be deleted.
     if (process.env.WATERMARK_URL) safeUnlink(wmPath);
 
@@ -236,6 +247,12 @@ app.get("/", (_req, res) => {
  * Each streamId is a "room". Broadcasts go to that room only.
  */
 const server = http.createServer(app);
+
+// === server-level timeouts set to 2 minutes ===
+server.requestTimeout = TWO_MIN_MS;        // time allowed for the entire request/response cycle
+server.headersTimeout = TWO_MIN_MS + 10000; // allow a bit more than requestTimeout for headers
+server.keepAliveTimeout = TWO_MIN_MS;       // keep-alive sockets last up to 2 min
+
 const wss = new WebSocket.Server({ noServer: true });
 const rooms = new Map(); // streamId -> Set<ws>
 const HEARTBEAT_MS = 25000;
