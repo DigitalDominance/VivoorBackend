@@ -29,7 +29,7 @@ const ALLOWED_ORIGINS = new Set([
   "https://preview--vivoor-live-glow.lovable.app",
   "https://www.vivoor.xyz",
   "https://vivoor.xyz",
-  "https://qcowmxypihinteajhnjw.supabase.co/functions/v1/watermark-clip",
+  "https://qcowmxypihinteajhnjw.supabase.co",
 ]);
 app.use(
   cors({
