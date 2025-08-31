@@ -172,18 +172,41 @@ app.post("/watermark", upload.single("video"), async (req, res) => {
     // 3) Run ffmpeg
     await runFfmpeg(inputPath, wmPath, outPath, { position, margin, wmWidth });
 
-    // 4) Stream back
+    /*
+     * At this point FFmpeg has finished and the output file has been flushed to disk. We
+     * no longer need the input video or any downloaded watermark asset to remain on
+     * disk. Removing these immediately frees up disk space and allows the kernel to
+     * release any associated caches, which can help prevent memory bloat on Heroku.
+     */
+    safeUnlink(inputPath);
+    // Only remove the downloaded watermark if WATERMARK_URL was used. When using
+    // WATERMARK_PATH or the built‑in asset the file lives outside of the temp
+    // directory and should not be deleted.
+    if (process.env.WATERMARK_URL) safeUnlink(wmPath);
+
+    // 4) Stream back the result. Use a read stream so the file is not buffered
+    // into memory. Once the response is finished we clean up the output file and
+    // temporary directory.
     const name = (filename && String(filename).trim()) || "watermarked.mp4";
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
-    const read = fs.createReadStream(outPath);
-    read.pipe(res);
-    read.on("close", () => {
-      safeUnlink(inputPath);
-      if (process.env.WATERMARK_URL) safeUnlink(wmPath);
+    const readStream = fs.createReadStream(outPath);
+    readStream.pipe(res);
+
+    const cleanup = () => {
+      // Remove the watermarked file itself. This happens after the file has
+      // finished streaming to the client. Using safeUnlink ensures any errors
+      // during deletion are ignored.
       safeUnlink(outPath);
+      // Remove the temporary directory created for this request. This forces
+      // removal even if there are lingering handles.
       fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {});
-    });
+    };
+    // When the read stream ends normally the 'close' event fires. On some
+    // connections Express will emit 'finish' on the response instead. Listen
+    // to both to ensure cleanup always occurs.
+    readStream.on("close", cleanup);
+    res.on("finish", cleanup);
   } catch (err) {
     console.error("[/watermark] error:", err);
     safeUnlink(inputPath);
