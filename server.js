@@ -88,9 +88,18 @@ async function runFfmpeg(inPath, wmPath, outPath, opts = {}) {
     position = "br",
     margin = 24,
     wmWidth = Number(process.env.WM_WIDTH_PX || 0),
-    preset = process.env.FFMPEG_PRESET || "veryfast",
+    // Use a more conservative preset by default. Ultrafast reduces memory usage
+    // compared to veryfast, while still providing reasonable performance for
+    // simple overlays. If the deployer wants to override this they can set
+    // FFMPEG_PRESET in the environment.
+    preset = process.env.FFMPEG_PRESET || "ultrafast",
     crf = Number(process.env.FFMPEG_CRF || 20),
-    threads = Number(process.env.FFMPEG_THREADS || 0),
+    // Heroku dynos have limited memory. By default ffmpeg will use a thread per
+    // core which can drastically increase memory usage (seen as 12 threads in
+    // logs). Limit the number of encoding threads to 2 by default, unless
+    // overridden via FFMPEG_THREADS. Using 1 or 2 threads greatly reduces
+    // memory consumption while still allowing parallelism during encoding.
+    threads = Number(process.env.FFMPEG_THREADS || 2),
   } = opts;
 
   const filter = makeFilter(position, Number(margin), wmWidth);
