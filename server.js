@@ -288,6 +288,55 @@ app.post("/watermark", upload.single("video"), async (req, res) => {
 
 });
 
+
+app.get("/watermark/status/:id", (req, res) => {
+  try {
+    const job = jobs.get(req.params.id);
+    const exists = Boolean(job);
+    if (!exists) {
+      // Return 404 to indicate unknown job id
+      return res.status(404).json({ error: "Job not found", id: req.params.id });
+    }
+    return res.json({
+      id: job.id,
+      status: job.status,
+      progress: job.progress,
+      error: job.error || null,
+      filename: job.filename || null,
+      resultReady: job.status === "completed",
+      resultUrl: job.status === "completed" ? `/watermark/result/${job.id}` : null,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+app.get("/watermark/result/:id", (req, res) => {
+  try {
+    const job = jobs.get(req.params.id);
+    if (!job) return res.status(404).json({ error: "Job not found" });
+    if (job.status !== "completed" || !job.outputPath || !fs.existsSync(job.outputPath)) {
+      return res.status(409).json({ error: "Result not ready" });
+    }
+    const name = (job.filename && String(job.filename).trim()) || "watermarked.mp4";
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
+    const rs = fs.createReadStream(job.outputPath);
+    rs.pipe(res);
+    const cleanup = () => {
+      safeUnlink(job.outputPath);
+      const dir = path.dirname(job.outputPath);
+      try { fs.promises.rm(dir, { recursive: true, force: true }); } catch {}
+      jobs.delete(job.id);
+    };
+    rs.on("close", cleanup);
+    res.on("finish", cleanup);
+  } catch (e) {
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
 app.get("/", (_req, res) => {
   res.type("text").send("Vivoor Watermark API + WebSockets. POST /watermark to add a logo to an MP4. WS at /ws?streamId=ID");
 });
