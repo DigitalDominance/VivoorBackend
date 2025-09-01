@@ -140,6 +140,106 @@ function safeUnlink(p) {
   fs.promises.unlink(p).catch(() => {});
 }
 
+/* ------------------------- B A C K G R O U N D  J O B S ------------------------- */
+/**
+ * Minimal in-process job queue to avoid Heroku 30s router timeouts.
+ * POST /watermark enqueues a job and returns { jobId } immediately.
+ * Clients can poll /watermark/status/:id and download via /watermark/result/:id.
+ * No external deps; data is kept in-memory and files in /tmp until download.
+ */
+const { randomUUID } = require("crypto");
+
+const JOB_TTL_MS = 60 * 60 * 1000; // keep jobs around for up to 1 hour
+const jobs = new Map(); // id -> { status, inputPath?, videoUrl?, opts, outputPath?, filename, error?, createdAt, updatedAt, progress }
+
+function makeTmpDir() {
+  const os = require("os"); const fs = require("fs"); const path = require("path");
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "wmk-job-"));
+  return d;
+}
+
+function enqueueWatermarkJob(payload) {
+  const id = randomUUID();
+  const job = {
+    id,
+    status: "queued",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    progress: 0,
+    ...payload,
+  };
+  jobs.set(id, job);
+  // process asynchronously so request can return immediately
+  setImmediate(() => processWatermarkJob(id).catch(() => {}));
+  return job;
+}
+
+async function processWatermarkJob(id) {
+  const job = jobs.get(id);
+  if (!job) return;
+  job.status = "processing"; job.updatedAt = Date.now();
+
+  const tmpRoot = makeTmpDir();
+  let tmpInput = job.inputPath || null;
+  let tmpWmPath = null;
+  const outPath = path.join(tmpRoot, `out-${Date.now()}.mp4`);
+
+  try {
+    const { videoUrl, position, margin, wmWidth, filename } = job.opts || {};
+    // Resolve input if using URL
+    if (!tmpInput) {
+      if (!videoUrl) throw new Error("Job missing input");
+      tmpInput = path.join(tmpRoot, "input.mp4");
+      await downloadToFile(videoUrl, tmpInput);
+    }
+
+    // Resolve watermark
+    if (process.env.WATERMARK_URL) {
+      tmpWmPath = path.join(tmpRoot, "wm.png");
+      await downloadToFile(process.env.WATERMARK_URL, tmpWmPath);
+    } else if (process.env.WATERMARK_PATH && fs.existsSync(process.env.WATERMARK_PATH)) {
+      tmpWmPath = process.env.WATERMARK_PATH;
+    } else {
+      tmpWmPath = path.join(__dirname, "assets", "logo.png");
+      if (!fs.existsSync(tmpWmPath)) throw new Error("Watermark not found. Set WATERMARK_URL or add assets/logo.png");
+    }
+
+    // Run ffmpeg
+    await runFfmpeg(tmpInput, tmpWmPath, outPath, { position, margin, wmWidth });
+
+    // Cleanup input + downloaded WM if applicable
+    safeUnlink(tmpInput);
+    if (process.env.WATERMARK_URL) safeUnlink(tmpWmPath);
+
+    job.outputPath = outPath;
+    job.filename = (filename && String(filename).trim()) || "watermarked.mp4";
+    job.status = "completed";
+    job.progress = 100;
+    job.updatedAt = Date.now();
+
+    // Schedule job directory cleanup after TTL if result not downloaded
+    setTimeout(() => {
+      const j = jobs.get(id);
+      if (j && j.status === "completed" && j.outputPath && fs.existsSync(j.outputPath)) {
+        safeUnlink(j.outputPath);
+        try { fs.promises.rm(tmpRoot, { recursive: true, force: true }); } catch {}
+        jobs.delete(id);
+      }
+    }, JOB_TTL_MS);
+  } catch (err) {
+    job.status = "failed";
+    job.error = String(err.message || err);
+    job.updatedAt = Date.now();
+    // Cleanup temp
+    safeUnlink(tmpInput);
+    if (tmpWmPath && process.env.WATERMARK_URL) safeUnlink(tmpWmPath);
+    safeUnlink(outPath);
+    try { fs.promises.rm(tmpRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+/* ------------------------------------------------------------------------ */
+}
+
 /* -------------------------------- A P I ---------------------------------- */
 app.get("/health", (_req, res) => {
   res.json({ ok: true, time: nowTs() });
@@ -158,83 +258,35 @@ app.get("/health", (_req, res) => {
  *  - WATERMARK_URL env, WATERMARK_PATH env, ./assets/logo.png
  */
 app.post("/watermark", upload.single("video"), async (req, res) => {
+  
+  // Background job mode: enqueue and return a job id immediately (avoids Heroku 30s H12)
   let inputPath = null;
-  let wmPath = null;
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wmk-"));
-  const outPath = path.join(tmp, `out-${Date.now()}.mp4`);
-
   try {
     const { videoUrl, position, margin, wmWidth, filename } = req.body || {};
 
-    // 1) Resolve input video
+    // If file uploaded, keep its temp path for the worker
     if (req.file?.path) {
       inputPath = req.file.path;
-    } else if (videoUrl) {
-      inputPath = path.join(tmp, "input.mp4");
-      await downloadToFile(videoUrl, inputPath);
-    } else {
-      return res.status(400).json({ error: "Provide 'video' or 'videoUrl'." });
     }
 
-    // 2) Resolve watermark
-    if (process.env.WATERMARK_URL) {
-      wmPath = path.join(tmp, "wm.png");
-      await downloadToFile(process.env.WATERMARK_URL, wmPath);
-    } else if (process.env.WATERMARK_PATH && fs.existsSync(process.env.WATERMARK_PATH)) {
-      wmPath = process.env.WATERMARK_PATH;
-    } else {
-      wmPath = path.join(__dirname, "assets", "logo.png");
-      if (!fs.existsSync(wmPath)) {
-        return res.status(500).json({ error: "Watermark not found. Set WATERMARK_URL or add assets/logo.png" });
-      }
-    }
+    const job = enqueueWatermarkJob({
+      inputPath,
+      opts: { videoUrl, position, margin, wmWidth, filename },
+    });
 
-    // 3) Run ffmpeg
-    await runFfmpeg(inputPath, wmPath, outPath, { position, margin, wmWidth });
-
-    /*
-     * At this point FFmpeg has finished and the output file has been flushed to disk. We
-     * no longer need the input video or any downloaded watermark asset to remain on
-     * disk. Removing these immediately frees up disk space and allows the kernel to
-     * release any associated caches, which can help prevent memory bloat on Heroku.
-     */
-    safeUnlink(inputPath);
-    // Only remove the downloaded watermark if WATERMARK_URL was used. When using
-    // WATERMARK_PATH or the built-in asset the file lives outside of the temp
-    // directory and should not be deleted.
-    if (process.env.WATERMARK_URL) safeUnlink(wmPath);
-
-    // 4) Stream back the result. Use a read stream so the file is not buffered
-    // into memory. Once the response is finished we clean up the output file and
-    // temporary directory.
-    const name = (filename && String(filename).trim()) || "watermarked.mp4";
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Disposition", `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
-    const readStream = fs.createReadStream(outPath);
-    readStream.pipe(res);
-
-    const cleanup = () => {
-      // Remove the watermarked file itself. This happens after the file has
-      // finished streaming to the client. Using safeUnlink ensures any errors
-      // during deletion are ignored.
-      safeUnlink(outPath);
-      // Remove the temporary directory created for this request. This forces
-      // removal even if there are lingering handles.
-      fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {});
-    };
-    // When the read stream ends normally the 'close' event fires. On some
-    // connections Express will emit 'finish' on the response instead. Listen
-    // to both to ensure cleanup always occurs.
-    readStream.on("close", cleanup);
-    res.on("finish", cleanup);
+    res.status(202).json({
+      ok: true,
+      jobId: job.id,
+      statusUrl: `/watermark/status/${job.id}`,
+      resultUrl: `/watermark/result/${job.id}`
+    });
   } catch (err) {
-    console.error("[/watermark] error:", err);
-    safeUnlink(inputPath);
-    if (process.env.WATERMARK_URL) safeUnlink(wmPath);
-    safeUnlink(outPath);
-    fs.promises.rm(tmp, { recursive: true, force: true }).catch(() => {});
+    // If enqueuing fails, make sure to remove uploaded temp file
+    if (inputPath) safeUnlink(inputPath);
+    console.error("[/watermark enqueue] error:", err);
     res.status(500).json({ error: String(err.message || err) });
   }
+
 });
 
 app.get("/", (_req, res) => {
